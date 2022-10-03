@@ -1,0 +1,23 @@
+[package]
+name = "eva-client"
+version = "0.1.6"
+edition = "2021"
+authors = ["Sergei S. <div@altertech.com>"]
+license = "Apache-2.0"
+description = "RT/HTTP Client for EVA ICS v4"
+readme = "README.md"
+keywords = ["eva-ics", "iot", "industrial", "scada", "cloud"]
+repository = "https://github.com/eva-ics/eva4-client"
+
+[lib]
+name = "eva_client"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.127", default-features = false, features = ["derive", "std"] }
+hyper = { version = "0.14.18", features = ["client", "http1", "tcp"] }
+hyper-tls = { version = "0.5.0" }
+eva-rjrpc = { version = "0.1.15" }
+eva-common = { version = "0.1.176", features = [ "events", "extended-value", "bus-rpc"] }
+busrt = { version = "0.3", features = ["rpc", "ipc" ] }
+tokio = { version = "1.15.0", features = ["full"] }
