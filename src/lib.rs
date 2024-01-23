@@ -23,6 +23,8 @@ pub type HttpClient = hyper::Client<HttpsConnector<HttpConnector>>;
 static CLIENT_ITERATION: atomic::AtomicUsize = atomic::AtomicUsize::new(1);
 const CT_HEADER: &str = "application/msgpack";
 
+pub const LOCAL: &str = ".local";
+
 #[derive(Deserialize)]
 pub struct SystemInfo {
     pub system_name: String,
@@ -71,23 +73,57 @@ impl VersionInfo {
 #[allow(clippy::module_name_repetitions)]
 pub struct EvaCloudClient {
     system_name: String,
-    client: EvaClient,
+    client: Arc<EvaClient>,
     node_map: NodeMap,
 }
 
 impl EvaCloudClient {
-    pub fn new(system_name: &str, client: EvaClient, node_map: NodeMap) -> Self {
+    /// Create cloud client from a local
+    pub fn from_eva_client(system_name: &str, client: EvaClient, node_map: NodeMap) -> Self {
         Self {
             system_name: system_name.to_owned(),
-            client,
+            client: Arc::new(client),
             node_map,
         }
     }
+    /// Create cloud client from scratch
+    pub async fn connect(path: &str, base_name: &str, config: Config) -> EResult<Self> {
+        let local_client = EvaClient::connect(path, base_name, config).await?;
+        local_client.transform_into_cloud_client().await
+    }
     pub async fn get_system_info(&self, node: &str) -> EResult<SystemInfo> {
-        let info: SystemInfo = self.call(node, "eva.core", "test", None).await?;
+        let info: SystemInfo = self.call0(node, "eva.core", "test").await?;
         Ok(info)
     }
-    pub async fn call<T>(
+    pub async fn call_local0<T>(&self, target: &str, method: &str) -> EResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.rpc_call(LOCAL, target, method, None).await
+    }
+    pub async fn call_local<T, V>(&self, target: &str, method: &str, params: V) -> EResult<T>
+    where
+        T: DeserializeOwned,
+        V: Serialize,
+    {
+        self.rpc_call(LOCAL, target, method, Some(to_value(params)?))
+            .await
+    }
+    pub async fn call0<T>(&self, node: &str, target: &str, method: &str) -> EResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.rpc_call(node, target, method, None).await
+    }
+    pub async fn call<T, V>(&self, node: &str, target: &str, method: &str, params: V) -> EResult<T>
+    where
+        T: DeserializeOwned,
+        V: Serialize,
+    {
+        self.rpc_call(node, target, method, Some(to_value(params)?))
+            .await
+    }
+    pub async fn rpc_call<T>(
         &self,
         node: &str,
         target: &str,
@@ -119,6 +155,14 @@ impl EvaCloudClient {
                 )
                 .await
         }
+    }
+    #[inline]
+    pub fn client(&self) -> &EvaClient {
+        &self.client
+    }
+    #[inline]
+    pub fn client_cloned(&self) -> Arc<EvaClient> {
+        self.client.clone()
     }
 }
 
@@ -212,7 +256,7 @@ impl EvaClient {
         &self.name
     }
     pub async fn get_system_info(&self) -> EResult<SystemInfo> {
-        let info: SystemInfo = self.call("eva.core", "test", None).await?;
+        let info: SystemInfo = self.call0("eva.core", "test").await?;
         Ok(info)
     }
     async fn http_login(&self, client: &HttpClient) -> EResult<Arc<String>> {
@@ -245,12 +289,44 @@ impl EvaClient {
             Err(Error::access("no credentials set"))
         }
     }
+    pub async fn transform_into_cloud_client(self) -> EResult<EvaCloudClient> {
+        #[derive(Deserialize)]
+        struct NodeList {
+            name: String,
+            svc: Option<String>,
+        }
+        let system_name = self.get_system_info().await?.system_name;
+        let node_list: Vec<NodeList> = self.call0("eva.core", "node.list").await?;
+        let node_map: NodeMap = node_list
+            .into_iter()
+            .filter_map(|v| v.svc.map(|s| (v.name, s)))
+            .collect();
+        Ok(EvaCloudClient::from_eva_client(
+            &system_name,
+            self,
+            node_map,
+        ))
+    }
+    pub async fn call0<T>(&self, target: &str, method: &str) -> EResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.rpc_call(target, method, None::<()>).await
+    }
+    pub async fn call<T, V>(&self, target: &str, method: &str, params: V) -> EResult<T>
+    where
+        T: DeserializeOwned,
+        V: Serialize,
+    {
+        self.rpc_call(target, method, Some(params)).await
+    }
     /// # Panics
     ///
     /// Will panic if token mutex is poisoned
-    pub async fn call<T>(&self, target: &str, method: &str, params: Option<Value>) -> EResult<T>
+    pub async fn rpc_call<T, V>(&self, target: &str, method: &str, params: Option<V>) -> EResult<T>
     where
         T: DeserializeOwned,
+        V: Serialize,
     {
         match self.client {
             ClientKind::Bus(ref c) => {
@@ -273,9 +349,16 @@ impl EvaClient {
             }
             ClientKind::Http(ref client) => {
                 let to: Option<Arc<String>> = self.token.lock().unwrap().clone();
+                let params_payload = to_value(params)?;
                 if let Some(token) = to {
                     match self
-                        .safe_http_call(client, Some(&token), Some(target), method, params.clone())
+                        .safe_http_call(
+                            client,
+                            Some(&token),
+                            Some(target),
+                            method,
+                            Some(params_payload.clone()),
+                        )
                         .await
                     {
                         Err(e)
@@ -284,15 +367,27 @@ impl EvaClient {
                         {
                             // repeat request with new token
                             let token = self.http_login(client).await?;
-                            self.safe_http_call(client, Some(&token), Some(target), method, params)
-                                .await
+                            self.safe_http_call(
+                                client,
+                                Some(&token),
+                                Some(target),
+                                method,
+                                Some(params_payload),
+                            )
+                            .await
                         }
                         res => res,
                     }
                 } else {
                     let token = self.http_login(client).await?;
-                    self.safe_http_call(client, Some(&token), Some(target), method, params)
-                        .await
+                    self.safe_http_call(
+                        client,
+                        Some(&token),
+                        Some(target),
+                        method,
+                        Some(params_payload),
+                    )
+                    .await
                 }
             }
         }
