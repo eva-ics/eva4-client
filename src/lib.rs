@@ -169,6 +169,7 @@ impl EvaCloudClient {
 #[derive(Debug, Clone)]
 pub struct Config {
     credentials: Option<(String, String)>,
+    token: Option<String>,
     timeout: Duration,
 }
 
@@ -177,6 +178,13 @@ impl Config {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Set API key/token
+    #[inline]
+    pub fn token(mut self, token: &str) -> Self {
+        self.token = Some(token.to_owned());
+        self
+    }
+    /// perform HTTP login with credentials
     #[inline]
     pub fn credentials(mut self, login: &str, password: &str) -> Self {
         self.credentials = Some((login.to_owned(), password.to_owned()));
@@ -194,6 +202,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             credentials: None,
+            token: None,
             timeout: eva_common::DEFAULT_TIMEOUT,
         }
     }
@@ -205,6 +214,7 @@ pub struct EvaClient {
     client: ClientKind,
     config: Config,
     token: Mutex<Option<Arc<String>>>,
+    token_preassigned: bool,
     path: String,
     request_id: atomic::AtomicU32,
 }
@@ -216,16 +226,21 @@ impl EvaClient {
             let http_client: hyper::Client<_> = hyper::Client::builder()
                 .pool_idle_timeout(config.timeout)
                 .build(https);
+            let token = config.token.clone();
+            let has_token = token.is_some();
             let cl = Self {
                 name: base_name.to_owned(),
                 client: ClientKind::Http(http_client),
                 config,
-                token: <_>::default(),
+                token: Mutex::new(token.map(Arc::new)),
+                token_preassigned: has_token,
                 path: path.to_owned(),
                 request_id: atomic::AtomicU32::new(0),
             };
-            if let ClientKind::Http(ref client) = cl.client {
-                cl.http_login(client).await?;
+            if !has_token {
+                if let ClientKind::Http(ref client) = cl.client {
+                    cl.http_login(client).await?;
+                }
             }
             Ok(cl)
         } else {
@@ -246,6 +261,7 @@ impl EvaClient {
                 client: ClientKind::Bus(rpc),
                 config,
                 token: <_>::default(),
+                token_preassigned: false,
                 path: path.to_owned(),
                 request_id: atomic::AtomicU32::new(0),
             })
@@ -349,7 +365,11 @@ impl EvaClient {
             }
             ClientKind::Http(ref client) => {
                 let to: Option<Arc<String>> = self.token.lock().unwrap().clone();
-                let params_payload = to_value(params)?;
+                let params_payload = if let Some(p) = params {
+                    Some(to_value(p)?)
+                } else {
+                    None
+                };
                 if let Some(token) = to {
                     match self
                         .safe_http_call(
@@ -357,13 +377,14 @@ impl EvaClient {
                             Some(&token),
                             Some(target),
                             method,
-                            Some(params_payload.clone()),
+                            params_payload.clone(),
                         )
                         .await
                     {
                         Err(e)
-                            if e.kind() == ErrorKind::AccessDenied
-                                && e.message().map_or(false, |m| m == "invalid token") =>
+                            if !self.token_preassigned
+                                && e.kind() == ErrorKind::AccessDenied
+                                && (e.message() == Some("invalid token")) =>
                         {
                             // repeat request with new token
                             let token = self.http_login(client).await?;
@@ -372,7 +393,7 @@ impl EvaClient {
                                 Some(&token),
                                 Some(target),
                                 method,
-                                Some(params_payload),
+                                params_payload,
                             )
                             .await
                         }
@@ -380,14 +401,8 @@ impl EvaClient {
                     }
                 } else {
                     let token = self.http_login(client).await?;
-                    self.safe_http_call(
-                        client,
-                        Some(&token),
-                        Some(target),
-                        method,
-                        Some(params_payload),
-                    )
-                    .await
+                    self.safe_http_call(client, Some(&token), Some(target), method, params_payload)
+                        .await
                 }
             }
         }
